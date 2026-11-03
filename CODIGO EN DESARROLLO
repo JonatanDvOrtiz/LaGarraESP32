@@ -1,0 +1,740 @@
+#include <Arduino.h>
+#include <esp_timer.h>
+#include <ESP32Servo.h>   // Biblioteca de servos compatible con ESP32
+
+// =====================================================
+// PINES
+// =====================================================
+
+// Sensor ultrasónico HC-SR04: SOLO valida presencia de objeto
+// CAMBIO: TRIG pasó del GPIO 18 al 21 (el 18 ahora es STEP del motor)
+#define ULTRA_TRIG 18
+#define ULTRA_ECHO 5
+
+// Sensores de clasificación
+#define SENSOR2 26
+#define SENSOR3 27
+
+// Botones
+#define INICIO 4
+#define STOP   17
+
+// Banda transportadora: motor paso a paso
+// CAMBIO: pines del código de prueba verificado (STEP 18, DIR 19)
+#define BANDA_STEP 19
+#define BANDA_DIR  21
+
+// Servomotores de la garra
+#define SERVO1_PIN 13
+#define SERVO2_PIN 14
+#define SERVO3_PIN 22
+#define SERVO4_PIN 23
+
+
+// =====================================================
+// CONFIGURACIÓN DEL MOTOR DE LA BANDA
+// =====================================================
+
+// CAMBIO: 500 pasos/s = 1000 us en alto + 1000 us en bajo (igual que la prueba)
+#define VELOCIDAD_PASOS_S          500   // Velocidad final (pasos/s)
+#define VELOCIDAD_INICIAL_PASOS_S  100   // Velocidad de arranque (pasos/s)
+#define ACELERACION_PASOS_S2       1500  // Rampa de aceleración
+#define SENTIDO_BANDA              HIGH  // HIGH o LOW para invertir el sentido
+
+
+// =====================================================
+// CONFIGURACIÓN DEL SENSOR ULTRASÓNICO
+// =====================================================
+
+// Distancia (cm) a la que se considera que hay un objeto presente
+#define DISTANCIA_DETECCION_CM 7.0
+
+// Tiempo (ms) que, tras detectar presencia, quedan habilitados los
+// sensores 2 y 3. Ajústalo según la posición del ultrasónico en la banda.
+#define VENTANA_HABILITACION_MS 300
+
+// 1 = imprime la distancia por el monitor serie (115200)
+#define DEBUG_DISTANCIA 0
+
+
+// =====================================================
+// CONFIGURACIÓN DE LOS SERVOMOTORES (sin cambios)
+// =====================================================
+
+#define NUM_SERVOS   4
+#define NUM_SENSORES 3
+
+const int PIN_SERVO[NUM_SERVOS] = { SERVO1_PIN, SERVO2_PIN, SERVO3_PIN, SERVO4_PIN };
+
+// Ángulo en reposo de cada servo, 0 a 180
+const int ANGULO_INICIAL[NUM_SERVOS] = {   17,   30,   80,   93 };
+
+// Ángulos S1:N17, Min10, Max17
+// Ángulos S2:N30, Min0, Max30
+// Ángulos S3:80, Min0, Max80
+// Ángulos S4:N93, Min0, Max93
+
+// Ángulo final de cada servo según el sensor que detectó el objeto.
+// Fila = sensor, columna = servo.
+// La fila 0 (ultrasónico) YA NO SE USA: el ultrasónico no activa la garra.
+const int ANGULO_FINAL[NUM_SENSORES][NUM_SERVOS] = {
+    //  S1   S2   S3   S4
+    {   17,  90,  90,  90 },   // (sin uso) ultrasónico
+    {   10,  90,  90,  90 },   // SENSOR2 (GPIO 26)
+    {   10,  90,  90,  90 }    // SENSOR3 (GPIO 27)
+};
+
+#define PULSO_MIN 500
+#define PULSO_MAX 2400
+
+Servo servos[NUM_SERVOS];
+
+
+// =====================================================
+// CONFIGURACIÓN DEL PROCESO
+// =====================================================
+
+// Tiempo que permanece activa la garra (ms)
+#define TIEMPO_GARRA 3000
+
+// Periodo de muestreo de los sensores digitales (ms)
+#define TIEMPO_SENSORES 10
+
+// Periodo de medición del ultrasónico (ms). Mínimo recomendado: 50
+#define TIEMPO_ULTRASONICO 50
+
+// Lecturas consecutivas necesarias para confirmar (o liberar) un sensor
+#define CONFIRMACIONES_SENSOR 3
+
+// Tiempo mínimo entre dos pulsaciones de START aceptadas (ms)
+#define ANTIREBOTE_INICIO_MS 200
+
+
+// =====================================================
+// PRIORIDADES Y NÚCLEOS DE LAS TAREAS
+// =====================================================
+
+#define PRIO_CONTROL   6   // STOP / START (máxima)
+#define PRIO_SENSORES  5
+#define PRIO_GARRA     4
+#define PRIO_BANDA     3
+
+// Todas las tareas de la aplicación van al núcleo 1 (APP_CPU).
+// El generador de pasos (esp_timer) corre por defecto en el núcleo 0.
+#define NUCLEO_APP 1
+
+// Bits de notificación
+#define NOTIF_STOP       0x01UL
+#define NOTIF_START      0x02UL
+#define NOTIF_ABORTAR    0x01UL
+#define NOTIF_ACTUALIZAR 0x01UL
+#define NOTIF_REANUDAR   0x02UL   // START tras una emergencia (aviso a la garra)
+#define TODOS_LOS_BITS   0xFFFFFFFFUL
+
+
+// =====================================================
+// ESTADO COMPARTIDO
+// =====================================================
+
+// Todas estas variables se leen/escriben dentro de secciones críticas (mux)
+// cuando se combinan varias; los booleanos sueltos son atómicos en ESP32.
+volatile bool     sistemaActivo    = false;  // START presionado y sin emergencia
+volatile bool     emergenciaActiva = false;  // STOP enganchado hasta nuevo START
+volatile bool     garraOcupada     = false;  // La garra tiene un movimiento reservado/en curso
+volatile bool     bandaGirando     = false;  // Orden para el generador de pasos
+volatile uint32_t generacionParada = 0;      // Se incrementa con cada STOP
+
+// Medición del ultrasónico (la escribe la interrupción de ECHO)
+volatile uint32_t echoInicioUs   = 0;
+volatile uint32_t echoDuracionUs = 0;
+volatile bool     echoListo      = false;
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Evento que viaja del sensor a la garra
+struct EventoGarra
+{
+    uint8_t  sensor;       // 2 = SENSOR2, 3 = SENSOR3
+    uint32_t generacion;   // Generación de STOP vigente cuando se creó
+};
+
+QueueHandle_t colaGarra = NULL;
+
+TaskHandle_t tareaControl  = NULL;
+TaskHandle_t tareaSensores = NULL;
+TaskHandle_t tareaGarra    = NULL;
+TaskHandle_t tareaBanda    = NULL;
+
+esp_timer_handle_t timerPasos = NULL;
+
+
+// =====================================================
+// GENERADOR DE PASOS DEL MOTOR
+// =====================================================
+
+// Se ejecuta en el timer de esp_timer (núcleo 0). Alterna STEP en alto/bajo
+// (50 % de ciclo) sin esperas de busy-wait, y re-arma el siguiente disparo.
+// Solo emite pulsos si bandaGirando es true.
+static uint32_t velocidadActual = VELOCIDAD_INICIAL_PASOS_S;
+static uint32_t semiperiodoUs   = 1000;
+static volatile bool pasoAlto   = false;
+
+void generarPaso(void *arg)
+{
+    uint32_t espera;
+
+    if (pasoAlto)
+    {
+        gpio_set_level((gpio_num_t)BANDA_STEP, 0);
+        pasoAlto = false;
+        espera = semiperiodoUs;
+    }
+    else if (bandaGirando)
+    {
+        if (velocidadActual < VELOCIDAD_PASOS_S)
+        {
+            velocidadActual += ACELERACION_PASOS_S2 / velocidadActual;
+            if (velocidadActual > VELOCIDAD_PASOS_S)
+            {
+                velocidadActual = VELOCIDAD_PASOS_S;
+            }
+        }
+
+        semiperiodoUs = 500000UL / velocidadActual;
+        gpio_set_level((gpio_num_t)BANDA_STEP, 1);
+        pasoAlto = true;
+        espera = semiperiodoUs;
+    }
+    else
+    {
+        // Detenida: el próximo arranque empieza desde la velocidad inicial
+        velocidadActual = (VELOCIDAD_INICIAL_PASOS_S < VELOCIDAD_PASOS_S)
+                          ? VELOCIDAD_INICIAL_PASOS_S
+                          : VELOCIDAD_PASOS_S;
+        espera = 1000;
+    }
+
+    esp_timer_start_once(timerPasos, espera);
+}
+
+
+// =====================================================
+// FUNCIONES DE LA GARRA (solo las usa tareaGarra y setup)
+// =====================================================
+
+void garraActivar(int sensor)
+{
+    if (sensor < 1 || sensor > NUM_SENSORES)
+    {
+        return;
+    }
+
+    for (int i = 0; i < NUM_SERVOS; i++)
+    {
+        servos[i].write(ANGULO_FINAL[sensor - 1][i]);
+    }
+}
+
+void garraDesactivar()
+{
+    for (int i = 0; i < NUM_SERVOS; i++)
+    {
+        servos[i].write(ANGULO_INICIAL[i]);
+    }
+}
+
+
+// =====================================================
+// FUNCIONES DEL SENSOR ULTRASÓNICO (sin cambios)
+// =====================================================
+
+// Envía el pulso TRIG. Solo quedan esperas de 2 y 10 microsegundos,
+// exigidas por el HC-SR04. No espera el eco.
+void dispararUltrasonico()
+{
+    portENTER_CRITICAL(&mux);
+    echoListo = false;
+    echoInicioUs = 0;
+    portEXIT_CRITICAL(&mux);
+
+    digitalWrite(ULTRA_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(ULTRA_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(ULTRA_TRIG, LOW);
+}
+
+// Última distancia en cm, o -1 si no hubo eco completo
+float leerDistanciaCm()
+{
+    bool listo;
+    uint32_t duracion;
+
+    portENTER_CRITICAL(&mux);
+    listo = echoListo;
+    duracion = echoDuracionUs;
+    portEXIT_CRITICAL(&mux);
+
+    if (!listo)
+    {
+        return -1.0;
+    }
+
+    return duracion / 58.0;
+}
+
+
+// =====================================================
+// INTERRUPCIONES
+// =====================================================
+
+// START: solo avisa a la tarea de control (el antirrebote se hace allí)
+void IRAM_ATTR interrupcionInicio()
+{
+    BaseType_t despertar = pdFALSE;
+
+    if (tareaControl != NULL)
+    {
+        xTaskNotifyFromISR(tareaControl, NOTIF_START, eSetBits, &despertar);
+    }
+
+    if (despertar == pdTRUE)
+    {
+        portYIELD_FROM_ISR();
+    }
+}
+
+// STOP: la parada del motor ocurre AQUÍ, sin esperar a ninguna tarea.
+// Después despierta a la tarea de control (prioridad máxima).
+void IRAM_ATTR interrupcionStop()
+{
+    BaseType_t despertar = pdFALSE;
+
+    portENTER_CRITICAL_ISR(&mux);
+    emergenciaActiva = true;
+    sistemaActivo    = false;
+    bandaGirando     = false;
+    generacionParada++;
+    portEXIT_CRITICAL_ISR(&mux);
+
+    gpio_set_level((gpio_num_t)BANDA_STEP, 0);
+
+    if (tareaControl != NULL)
+    {
+        xTaskNotifyFromISR(tareaControl, NOTIF_STOP, eSetBits, &despertar);
+    }
+
+    if (despertar == pdTRUE)
+    {
+        portYIELD_FROM_ISR();
+    }
+}
+
+// ECHO del ultrasónico (flanco de subida y de bajada)
+void IRAM_ATTR interrupcionEcho()
+{
+    uint32_t ahora = (uint32_t)esp_timer_get_time();
+
+    portENTER_CRITICAL_ISR(&mux);
+
+    if (gpio_get_level((gpio_num_t)ULTRA_ECHO) == HIGH)
+    {
+        echoInicioUs = ahora;
+    }
+    else if (echoInicioUs != 0)
+    {
+        echoDuracionUs = ahora - echoInicioUs;
+        echoListo = true;
+        echoInicioUs = 0;
+    }
+
+    portEXIT_CRITICAL_ISR(&mux);
+}
+
+
+// =====================================================
+// TAREA CONTROL (STOP / START) - PRIORIDAD MÁXIMA
+// =====================================================
+
+void tareaControlFn(void *parametro)
+{
+    TickType_t ultimoInicio = 0;
+    bool hayInicioPrevio = false;
+
+    for (;;)
+    {
+        uint32_t bits = 0;
+
+        // Espera por notificación (con tiempo límite, nunca infinita)
+        if (xTaskNotifyWait(0, TODOS_LOS_BITS, &bits, pdMS_TO_TICKS(100)) != pdTRUE)
+        {
+            continue;
+        }
+
+        // ---------------- STOP ----------------
+        if (bits & NOTIF_STOP)
+        {
+            // La ISR ya apagó el motor. Aquí se refuerza y se avisa al resto.
+            portENTER_CRITICAL(&mux);
+            bandaGirando = false;
+            portEXIT_CRITICAL(&mux);
+            gpio_set_level((gpio_num_t)BANDA_STEP, 0);
+
+            // Interrumpe la espera de la garra. La garra NO se mueve:
+            // los servos quedan en la posición en que estaban.
+            xTaskNotify(tareaGarra, NOTIF_ABORTAR, eSetBits);
+            xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+        }
+
+        // ---------------- START ----------------
+        if (bits & NOTIF_START)
+        {
+            TickType_t ahora = xTaskGetTickCount();
+            bool rebote = hayInicioPrevio &&
+                          ((ahora - ultimoInicio) < pdMS_TO_TICKS(ANTIREBOTE_INICIO_MS));
+
+            // START solo se acepta si sigue presionado y STOP está liberado
+            if (!rebote &&
+                digitalRead(INICIO) == LOW &&
+                digitalRead(STOP) == HIGH)
+            {
+                bool veniaDeEmergencia;
+
+                portENTER_CRITICAL(&mux);
+                veniaDeEmergencia = emergenciaActiva;
+                emergenciaActiva = false;
+                sistemaActivo    = true;
+                portEXIT_CRITICAL(&mux);
+
+                ultimoInicio = ahora;
+                hayInicioPrevio = true;
+
+                // Solo tras una emergencia se avisa a la garra de que
+                // una persona reanudó el sistema.
+                if (veniaDeEmergencia)
+                {
+                    xTaskNotify(tareaGarra, NOTIF_REANUDAR, eSetBits);
+                }
+
+                xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+            }
+        }
+    }
+}
+
+
+// =====================================================
+// TAREA SENSORES
+// =====================================================
+
+struct SensorClasif
+{
+    uint8_t pin;
+    uint8_t id;          // 2 o 3
+    uint8_t cntActivo;   // lecturas consecutivas con objeto
+    uint8_t cntLibre;    // lecturas consecutivas sin objeto
+    bool    armado;      // true = puede generar un nuevo evento
+};
+
+void tareaSensoresFn(void *parametro)
+{
+    SensorClasif sens[2] = {
+        { SENSOR2, 2, 0, 0, true },
+        { SENSOR3, 3, 0, 0, true }
+    };
+
+    const TickType_t periodo = pdMS_TO_TICKS(TIEMPO_SENSORES);
+    const TickType_t ventana = pdMS_TO_TICKS(VENTANA_HABILITACION_MS);
+    const uint32_t ciclosUltra = TIEMPO_ULTRASONICO / TIEMPO_SENSORES;
+
+    uint32_t ciclo = ciclosUltra;      // mide en el primer ciclo
+    bool presenciaVista = false;
+    TickType_t tickPresencia = 0;
+
+    TickType_t referencia = xTaskGetTickCount();
+
+    for (;;)
+    {
+        // Periodo exacto basado en ticks, sin deriva
+        vTaskDelayUntil(&referencia, periodo);
+
+        // ---------- Ultrasónico: valida presencia ----------
+        if (++ciclo >= ciclosUltra)
+        {
+            ciclo = 0;
+
+            float distancia = leerDistanciaCm();
+            dispararUltrasonico();
+
+            if (distancia > 0.0 && distancia <= DISTANCIA_DETECCION_CM)
+            {
+                presenciaVista = true;
+                tickPresencia = xTaskGetTickCount();
+            }
+
+#if DEBUG_DISTANCIA
+            Serial.print("Distancia: ");
+            if (distancia > 0.0)
+            {
+                Serial.print(distancia, 1);
+                Serial.println(" cm");
+            }
+            else
+            {
+                Serial.println("sin eco");
+            }
+#endif
+        }
+
+        // ---------- ¿Sistema iniciado? ----------
+        bool activo;
+        portENTER_CRITICAL(&mux);
+        activo = sistemaActivo && !emergenciaActiva;
+        portEXIT_CRITICAL(&mux);
+
+        if (!activo)
+        {
+            // Sistema detenido: se reinicia el antirrebote
+            for (int i = 0; i < 2; i++)
+            {
+                sens[i].cntActivo = 0;
+                sens[i].cntLibre  = 0;
+                sens[i].armado    = true;
+            }
+            continue;
+        }
+
+        // El ultrasónico habilita a los sensores 2 y 3 mientras la
+        // presencia detectada esté dentro de la ventana de tiempo.
+        bool habilitado = presenciaVista &&
+                          ((TickType_t)(xTaskGetTickCount() - tickPresencia) <= ventana);
+
+        // ---------- Sensores de clasificación ----------
+        for (int i = 0; i < 2; i++)
+        {
+            bool detecta = (digitalRead(sens[i].pin) == LOW);
+
+            if (detecta)
+            {
+                sens[i].cntLibre = 0;
+                if (sens[i].cntActivo < 255) sens[i].cntActivo++;
+            }
+            else
+            {
+                sens[i].cntActivo = 0;
+                if (sens[i].cntLibre < 255) sens[i].cntLibre++;
+
+                // Se rearma solo cuando el sensor quedó libre
+                if (sens[i].cntLibre >= CONFIRMACIONES_SENSOR)
+                {
+                    sens[i].armado = true;
+                }
+            }
+
+            if (sens[i].armado &&
+                sens[i].cntActivo >= CONFIRMACIONES_SENSOR &&
+                habilitado)
+            {
+                bool reservado = false;
+                EventoGarra evento;
+
+                // Reserva atómica de la garra: evita eventos duplicados
+                portENTER_CRITICAL(&mux);
+                if (sistemaActivo && !emergenciaActiva && !garraOcupada)
+                {
+                    garraOcupada = true;
+                    evento.sensor = sens[i].id;
+                    evento.generacion = generacionParada;
+                    reservado = true;
+                }
+                portEXIT_CRITICAL(&mux);
+
+                if (reservado)
+                {
+                    // Un objeto ya atendido no puede reactivar ningún sensor
+                    // hasta que ambos queden libres.
+                    sens[0].armado = false;
+                    sens[1].armado = false;
+
+                    xQueueSend(colaGarra, &evento, 0);
+                    xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);   // detener la banda ya
+                    break;
+                }
+            }
+        }
+    }
+}
+
+
+// =====================================================
+// TAREA BANDA (única que ordena girar/detener al motor)
+// =====================================================
+
+void tareaBandaFn(void *parametro)
+{
+    for (;;)
+    {
+        uint32_t bits;
+
+        // Reacciona al instante a una notificación o revisa cada 20 ms
+        xTaskNotifyWait(0, TODOS_LOS_BITS, &bits, pdMS_TO_TICKS(20));
+
+        // Decisión y escritura juntas, bajo el mismo bloqueo que usa STOP:
+        // así esta tarea nunca puede reactivar la banda después de un STOP.
+        portENTER_CRITICAL(&mux);
+        bandaGirando = sistemaActivo && !emergenciaActiva && !garraOcupada;
+        portEXIT_CRITICAL(&mux);
+    }
+}
+
+
+// =====================================================
+// TAREA GARRA (única que mueve los servos)
+// =====================================================
+
+void tareaGarraFn(void *parametro)
+{
+    for (;;)
+    {
+        EventoGarra evento;
+        uint32_t bits;
+
+        if (xQueueReceive(colaGarra, &evento, pdMS_TO_TICKS(100)) != pdTRUE)
+        {
+            continue;
+        }
+
+        // Descartar un aviso anterior que siga pendiente
+        xTaskNotifyWait(0, TODOS_LOS_BITS, &bits, 0);
+
+        // Validar el evento: sistema activo y sin STOP desde que se creó
+        bool valido;
+        portENTER_CRITICAL(&mux);
+        valido = sistemaActivo && !emergenciaActiva &&
+                 (evento.generacion == generacionParada);
+        portEXIT_CRITICAL(&mux);
+
+        if (valido)
+        {
+            // Movimiento de almacenamiento correspondiente al sensor
+            garraActivar(evento.sensor);
+
+            // Mantiene la posición TIEMPO_GARRA ms. Si llega STOP,
+            // la espera termina inmediatamente.
+            xTaskNotifyWait(0, TODOS_LOS_BITS, &bits, pdMS_TO_TICKS(TIEMPO_GARRA));
+
+            // Se comprueba si hubo STOP durante el movimiento
+            bool huboStop;
+            portENTER_CRITICAL(&mux);
+            huboStop = emergenciaActiva || (evento.generacion != generacionParada);
+            portEXIT_CRITICAL(&mux);
+
+            if (huboStop)
+            {
+                // PARADA DE EMERGENCIA. Los servos NO se mueven:
+                // quedan exactamente en su posición actual. La garra sigue
+                // reservada (garraOcupada = true) y la banda sigue detenida.
+                // Se espera, sin bloquear indefinidamente, a que una persona
+                // presione START.
+                for (;;)
+                {
+                    bool reanudado;
+                    portENTER_CRITICAL(&mux);
+                    reanudado = sistemaActivo && !emergenciaActiva;
+                    portEXIT_CRITICAL(&mux);
+
+                    if (reanudado)
+                    {
+                        break;
+                    }
+
+                    xTaskNotifyWait(0, TODOS_LOS_BITS, &bits, pdMS_TO_TICKS(100));
+                }
+            }
+
+            // Fin normal, o START tras la emergencia: la garra vuelve al
+            // ángulo inicial (en el caso de emergencia, solo después de START).
+            garraDesactivar();
+        }
+
+        // Libera la garra y avisa a la banda
+        portENTER_CRITICAL(&mux);
+        garraOcupada = false;
+        portEXIT_CRITICAL(&mux);
+
+        xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+    }
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+#if DEBUG_DISTANCIA
+    Serial.begin(115200);
+#endif
+
+    // ---------- Entradas ----------
+    pinMode(SENSOR2, INPUT_PULLUP);
+    pinMode(SENSOR3, INPUT_PULLUP);
+    pinMode(INICIO, INPUT_PULLUP);
+    pinMode(STOP, INPUT_PULLUP);
+    pinMode(ULTRA_ECHO, INPUT);       // con divisor de tensión externo
+
+    // ---------- Salidas en estado seguro ----------
+    pinMode(BANDA_STEP, OUTPUT);
+    pinMode(BANDA_DIR, OUTPUT);
+    pinMode(ULTRA_TRIG, OUTPUT);
+    digitalWrite(ULTRA_TRIG, LOW);
+    digitalWrite(BANDA_STEP, LOW);
+    digitalWrite(BANDA_DIR, SENTIDO_BANDA);   // Sentido horario, como la prueba
+    bandaGirando = false;
+
+    // ---------- Servomotores en posición inicial ----------
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+    ESP32PWM::allocateTimer(3);
+
+    for (int i = 0; i < NUM_SERVOS; i++)
+    {
+        servos[i].setPeriodHertz(50);
+        servos[i].attach(PIN_SERVO[i], PULSO_MIN, PULSO_MAX);
+        servos[i].write(ANGULO_INICIAL[i]);
+    }
+
+    // ---------- Temporizador de pasos del motor ----------
+    esp_timer_create_args_t argsTimer = {};
+    argsTimer.callback = generarPaso;
+    argsTimer.arg = NULL;
+    argsTimer.dispatch_method = ESP_TIMER_TASK;
+    argsTimer.name = "pasos_banda";
+
+    esp_timer_create(&argsTimer, &timerPasos);
+    esp_timer_start_once(timerPasos, 1000);   // no emite pulsos hasta START
+
+    // ---------- Cola sensores -> garra ----------
+    colaGarra = xQueueCreate(2, sizeof(EventoGarra));
+
+    // ---------- Tareas ----------
+    // Orden: primero las que otras tareas notifican.
+    xTaskCreatePinnedToCore(tareaBandaFn,    "banda",    2048, NULL, PRIO_BANDA,    &tareaBanda,    NUCLEO_APP);
+    xTaskCreatePinnedToCore(tareaGarraFn,    "garra",    4096, NULL, PRIO_GARRA,    &tareaGarra,    NUCLEO_APP);
+    xTaskCreatePinnedToCore(tareaControlFn,  "control",  3072, NULL, PRIO_CONTROL,  &tareaControl,  NUCLEO_APP);
+    xTaskCreatePinnedToCore(tareaSensoresFn, "sensores", 3072, NULL, PRIO_SENSORES, &tareaSensores, NUCLEO_APP);
+
+    // ---------- Interrupciones (al final, con las tareas ya creadas) ----------
+    attachInterrupt(digitalPinToInterrupt(INICIO), interrupcionInicio, FALLING);
+    attachInterrupt(digitalPinToInterrupt(STOP),   interrupcionStop,   FALLING);
+    attachInterrupt(digitalPinToInterrupt(ULTRA_ECHO), interrupcionEcho, CHANGE);
+}
+
+void loop()
+{
+    // Todo el funcionamiento está en las tareas de FreeRTOS.
+    // Se elimina la tarea de Arduino para no consumir CPU.
+    vTaskDelete(NULL);
+}
