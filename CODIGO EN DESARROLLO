@@ -1,13 +1,25 @@
 #include <Arduino.h>
+#include "sdkconfig.h"
 #include <esp_timer.h>
-#include <ESP32Servo.h>   // Biblioteca de servos compatible con ESP32
+#include <ESP32Servo.h>  
 
-// =====================================================
-// PINES
-// =====================================================
+// ====================================
+// INTERRUPTOR DE BLUETOOTH
+// 1 = con Bluetooth
+// 0 = sin Bluetooth (para simulación)
+// ====================================
+#define USAR_BLUETOOTH 1
 
-// Sensor ultrasónico HC-SR04: SOLO valida presencia de objeto
-// CAMBIO: TRIG pasó del GPIO 18 al 21 (el 18 ahora es STEP del motor)
+#if USAR_BLUETOOTH
+  // Bluetooth clásico.
+  #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED) || !defined(CONFIG_BT_SPP_ENABLED)
+  #error "Esta placa o configuracion NO soporta Bluetooth clasico SPP (BluetoothSerial). Use un ESP32 original o adapte la comunicacion a BLE."
+  #endif
+  #include <BluetoothSerial.h>
+  BluetoothSerial SerialBT;
+#endif
+
+// Sensor ultrasónico HC-SR04
 #define ULTRA_TRIG 18
 #define ULTRA_ECHO 5
 
@@ -19,8 +31,7 @@
 #define INICIO 4
 #define STOP   17
 
-// Banda transportadora: motor paso a paso
-// CAMBIO: pines del código de prueba verificado (STEP 18, DIR 19)
+// Banda transportadora: motor paso a paso (A4988)
 #define BANDA_STEP 19
 #define BANDA_DIR  21
 
@@ -31,35 +42,34 @@
 #define SERVO4_PIN 23
 
 
-// =====================================================
+// ====================================
 // CONFIGURACIÓN DEL MOTOR DE LA BANDA
-// =====================================================
+// ====================================
 
-// CAMBIO: 500 pasos/s = 1000 us en alto + 1000 us en bajo (igual que la prueba)
 #define VELOCIDAD_PASOS_S          500   // Velocidad final (pasos/s)
 #define VELOCIDAD_INICIAL_PASOS_S  100   // Velocidad de arranque (pasos/s)
 #define ACELERACION_PASOS_S2       1500  // Rampa de aceleración
 #define SENTIDO_BANDA              HIGH  // HIGH o LOW para invertir el sentido
 
 
-// =====================================================
+// =====================================
 // CONFIGURACIÓN DEL SENSOR ULTRASÓNICO
-// =====================================================
+// =====================================
 
 // Distancia (cm) a la que se considera que hay un objeto presente
 #define DISTANCIA_DETECCION_CM 7.0
 
 // Tiempo (ms) que, tras detectar presencia, quedan habilitados los
-// sensores 2 y 3. Ajústalo según la posición del ultrasónico en la banda.
-#define VENTANA_HABILITACION_MS 300
+// sensores 2 y 3.
+#define VENTANA_HABILITACION_MS 10000
 
 // 1 = imprime la distancia por el monitor serie (115200)
 #define DEBUG_DISTANCIA 0
 
 
-// =====================================================
-// CONFIGURACIÓN DE LOS SERVOMOTORES (sin cambios)
-// =====================================================
+// ==================================
+// CONFIGURACIÓN DE LOS SERVOMOTORES
+// ==================================
 
 #define NUM_SERVOS   4
 #define NUM_SENSORES 3
@@ -67,21 +77,20 @@
 const int PIN_SERVO[NUM_SERVOS] = { SERVO1_PIN, SERVO2_PIN, SERVO3_PIN, SERVO4_PIN };
 
 // Ángulo en reposo de cada servo, 0 a 180
-const int ANGULO_INICIAL[NUM_SERVOS] = {   17,   30,   80,   93 };
-
-// Ángulos S1:N17, Min10, Max17
-// Ángulos S2:N30, Min0, Max30
-// Ángulos S3:80, Min0, Max80
-// Ángulos S4:N93, Min0, Max93
+const int ANGULO_INICIAL[NUM_SERVOS] = {   0,   30,   80,   100 };
 
 // Ángulo final de cada servo según el sensor que detectó el objeto.
 // Fila = sensor, columna = servo.
-// La fila 0 (ultrasónico) YA NO SE USA: el ultrasónico no activa la garra.
 const int ANGULO_FINAL[NUM_SENSORES][NUM_SERVOS] = {
+    // Pinza (S1)  Distancia (S2)  Altura (S3)  Base (S4)
+
     //  S1   S2   S3   S4
-    {   17,  90,  90,  90 },   // (sin uso) ultrasónico
-    {   10,  90,  90,  90 },   // SENSOR2 (GPIO 26)
-    {   10,  90,  90,  90 }    // SENSOR3 (GPIO 27)
+    {   24,  50,  80,  160 },   // SENSOR2 (GPIO 26)
+    {   17,  30,  80,  0 }    // SENSOR3 (GPIO 27)
+    // Pinza (S1)      De 0 a 24 grados
+    // Distancia (S2)  De 0 a 110 grados
+    // Altura (S3)De   0 a (estirado 60) (recogido 110) grados
+    // Base (S4)       Inicio (100), Izquierda (160 Max.), Derecha (0 Max.)
 };
 
 #define PULSO_MIN 500
@@ -90,9 +99,9 @@ const int ANGULO_FINAL[NUM_SENSORES][NUM_SERVOS] = {
 Servo servos[NUM_SERVOS];
 
 
-// =====================================================
-// CONFIGURACIÓN DEL PROCESO
-// =====================================================
+// ==========================
+// CONFIGURACIÓN DEL PROCESO 
+// ==========================
 
 // Tiempo que permanece activa la garra (ms)
 #define TIEMPO_GARRA 3000
@@ -110,14 +119,26 @@ Servo servos[NUM_SERVOS];
 #define ANTIREBOTE_INICIO_MS 200
 
 
-// =====================================================
+// ========================
+// CONFIGURACIÓN BLUETOOTH
+// ========================
+
+#define NOMBRE_BLUETOOTH      "LaGarra"
+#define PERIODO_TELEMETRIA_MS 500   // Envío del estado a la app
+#define PERIODO_TAREA_BT_MS   20    // Revisión de comandos recibidos
+#define TAM_LINEA_BT          48    // Tamaño máximo de un comando (incluye el terminador)
+#define MAX_BYTES_POR_CICLO   128   // Bytes leídos por iteración (no acapara la CPU)
+
+
+// ====================================
 // PRIORIDADES Y NÚCLEOS DE LAS TAREAS
-// =====================================================
+// ====================================
 
 #define PRIO_CONTROL   6   // STOP / START (máxima)
 #define PRIO_SENSORES  5
 #define PRIO_GARRA     4
 #define PRIO_BANDA     3
+#define PRIO_BLUETOOTH 2   // Inferior a todas las tareas de control
 
 // Todas las tareas de la aplicación van al núcleo 1 (APP_CPU).
 // El generador de pasos (esp_timer) corre por defecto en el núcleo 0.
@@ -132,9 +153,9 @@ Servo servos[NUM_SERVOS];
 #define TODOS_LOS_BITS   0xFFFFFFFFUL
 
 
-// =====================================================
+// ==================
 // ESTADO COMPARTIDO
-// =====================================================
+// ==================
 
 // Todas estas variables se leen/escriben dentro de secciones críticas (mux)
 // cuando se combinan varias; los booleanos sueltos son atómicos en ESP32.
@@ -151,26 +172,91 @@ volatile bool     echoListo      = false;
 
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-// Evento que viaja del sensor a la garra
+// ---------- Modo de operación ----------
+enum ModoOperacion : uint8_t { MODO_AUTO = 0, MODO_MANUAL = 1 };
+volatile ModoOperacion modoOperacion = MODO_AUTO;   // Arranca siempre en AUTO
+
+// Solicitud manual de funcionamiento de la banda (solo tiene efecto en MANUAL)
+volatile bool manualBandaSolicitada = false;
+
+// true mientras la garra está congelada por una emergencia
+volatile bool garraPausada = false;
+
+// ---------- Último evento mostrado en la app ----------
+enum CodigoEvento : uint8_t
+{
+    EV_NINGUNO = 0,
+    EV_SENSOR2,
+    EV_SENSOR3,
+    EV_MANUAL_S2,
+    EV_MANUAL_S3,
+    EV_HOME,
+    EV_BANDA_ON,
+    EV_BANDA_OFF,
+    EV_START_BT,
+    EV_STOP_BT,
+    EV_MODO_AUTO,
+    EV_MODO_MANUAL,
+    EV_RECH_MODO,
+    EV_RECH_EMERGENCIA,
+    EV_RECH_OCUPADA,
+    EV_RECH_STOP_FISICO,
+    EV_RECH_NO_ACTIVO,
+    EV_RECH_COLA,
+    EV_CMD_DESCONOCIDO,
+    EV_BT_DESCONECTADO,
+    EV_TOTAL
+};
+
+// Mismo orden que CodigoEvento. Sin ';' ni saltos de línea.
+const char *const NOMBRES_EVENTO[EV_TOTAL] = {
+    "NINGUNO", "SENSOR2", "SENSOR3", "MANUAL_S2", "MANUAL_S3", "HOME",
+    "BANDA_ON", "BANDA_OFF", "START_BT", "STOP_BT", "MODO_AUTO", "MODO_MANUAL",
+    "RECH_MODO", "RECH_EMERGENCIA", "RECH_OCUPADA", "RECH_STOP_FISICO",
+    "RECH_NO_ACTIVO", "RECH_COLA", "CMD_DESCONOCIDO", "BT_DESCONECTADO"
+};
+
+volatile uint8_t ultimoEvento = EV_NINGUNO;
+
+// ---------- Telemetría publicada por la tarea de sensores ----------
+// Se escribe y se lee siempre dentro de secciones críticas (mux).
+struct Telemetria
+{
+    float  distanciaCm;   // -1 = medición no válida
+    int8_t presencia;     // 1 = objeto dentro del umbral, 0 = sin objeto, -1 = sin medición válida
+    bool   s2;            // 1 = detectando (ya normalizado: el pin físico es activo en LOW)
+    bool   s3;
+    bool   habilitado;    // ventana de habilitación vigente
+};
+
+Telemetria tel = { -1.0f, -1, false, false, false };
+
+// ---------- Evento que viaja a la garra ----------
+#define ORIGEN_AUTO    0   // Generado por los sensores
+#define ORIGEN_MANUAL  1   // Orden manual desde la app
+#define ORIGEN_HOME    2   // Volver al reposo desde la app
+
 struct EventoGarra
 {
-    uint8_t  sensor;       // 2 = SENSOR2, 3 = SENSOR3
+    uint8_t  sensor;       // 2 = SENSOR2, 3 = SENSOR3 (0 en HOME)
     uint32_t generacion;   // Generación de STOP vigente cuando se creó
+    uint8_t  origen;       // ORIGEN_AUTO, ORIGEN_MANUAL u ORIGEN_HOME
 };
 
 QueueHandle_t colaGarra = NULL;
 
-TaskHandle_t tareaControl  = NULL;
-TaskHandle_t tareaSensores = NULL;
-TaskHandle_t tareaGarra    = NULL;
-TaskHandle_t tareaBanda    = NULL;
+TaskHandle_t tareaControl   = NULL;
+TaskHandle_t tareaSensores  = NULL;
+TaskHandle_t tareaGarra     = NULL;
+TaskHandle_t tareaBanda     = NULL;
+TaskHandle_t tareaBluetooth = NULL;
 
 esp_timer_handle_t timerPasos = NULL;
 
 
-// =====================================================
+// =============================
 // GENERADOR DE PASOS DEL MOTOR
-// =====================================================
+// =============================
 
 // Se ejecuta en el timer de esp_timer (núcleo 0). Alterna STEP en alto/bajo
 // (50 % de ciclo) sin esperas de busy-wait, y re-arma el siguiente disparo.
@@ -218,9 +304,9 @@ void generarPaso(void *arg)
 }
 
 
-// =====================================================
+// ========================================================
 // FUNCIONES DE LA GARRA (solo las usa tareaGarra y setup)
-// =====================================================
+// ========================================================
 
 void garraActivar(int sensor)
 {
@@ -244,9 +330,9 @@ void garraDesactivar()
 }
 
 
-// =====================================================
-// FUNCIONES DEL SENSOR ULTRASÓNICO (sin cambios)
-// =====================================================
+// =================================
+// FUNCIONES DEL SENSOR ULTRASÓNICO
+// =================================
 
 // Envía el pulso TRIG. Solo quedan esperas de 2 y 10 microsegundos,
 // exigidas por el HC-SR04. No espera el eco.
@@ -284,9 +370,9 @@ float leerDistanciaCm()
 }
 
 
-// =====================================================
+// ===============
 // INTERRUPCIONES
-// =====================================================
+// ===============
 
 // START: solo avisa a la tarea de control (el antirrebote se hace allí)
 void IRAM_ATTR interrupcionInicio()
@@ -352,9 +438,9 @@ void IRAM_ATTR interrupcionEcho()
 }
 
 
-// =====================================================
+// ================================================
 // TAREA CONTROL (STOP / START) - PRIORIDAD MÁXIMA
-// =====================================================
+// ================================================
 
 void tareaControlFn(void *parametro)
 {
@@ -377,6 +463,7 @@ void tareaControlFn(void *parametro)
             // La ISR ya apagó el motor. Aquí se refuerza y se avisa al resto.
             portENTER_CRITICAL(&mux);
             bandaGirando = false;
+            manualBandaSolicitada = false;   // Una emergencia anula la orden manual de banda
             portEXIT_CRITICAL(&mux);
             gpio_set_level((gpio_num_t)BANDA_STEP, 0);
 
@@ -404,6 +491,7 @@ void tareaControlFn(void *parametro)
                 veniaDeEmergencia = emergenciaActiva;
                 emergenciaActiva = false;
                 sistemaActivo    = true;
+                manualBandaSolicitada = false;   // En MANUAL la banda exige un BANDA;ON nuevo
                 portEXIT_CRITICAL(&mux);
 
                 ultimoInicio = ahora;
@@ -423,9 +511,9 @@ void tareaControlFn(void *parametro)
 }
 
 
-// =====================================================
+// ===============
 // TAREA SENSORES
-// =====================================================
+// ===============
 
 struct SensorClasif
 {
@@ -472,6 +560,14 @@ void tareaSensoresFn(void *parametro)
                 tickPresencia = xTaskGetTickCount();
             }
 
+            // Publicar distancia y presencia para la telemetría
+            portENTER_CRITICAL(&mux);
+            tel.distanciaCm = distancia;                     // -1 si no hubo eco válido
+            tel.presencia = (distancia > 0.0)
+                            ? ((distancia <= DISTANCIA_DETECCION_CM) ? 1 : 0)
+                            : -1;
+            portEXIT_CRITICAL(&mux);
+
 #if DEBUG_DISTANCIA
             Serial.print("Distancia: ");
             if (distancia > 0.0)
@@ -485,6 +581,22 @@ void tareaSensoresFn(void *parametro)
             }
 #endif
         }
+
+        // El ultrasónico habilita a los sensores 2 y 3 mientras la
+        // presencia detectada esté dentro de la ventana de tiempo.
+        bool habilitado = presenciaVista &&
+                          ((TickType_t)(xTaskGetTickCount() - tickPresencia) <= ventana);
+
+        // Publicar el estado lógico de los sensores aunque el sistema
+        // esté detenido (1 = detectando, 0 = libre; el pin físico es activo en LOW).
+        bool s2Detecta = (digitalRead(SENSOR2) == LOW);
+        bool s3Detecta = (digitalRead(SENSOR3) == LOW);
+
+        portENTER_CRITICAL(&mux);
+        tel.s2 = s2Detecta;
+        tel.s3 = s3Detecta;
+        tel.habilitado = habilitado;
+        portEXIT_CRITICAL(&mux);
 
         // ---------- ¿Sistema iniciado? ----------
         bool activo;
@@ -503,11 +615,6 @@ void tareaSensoresFn(void *parametro)
             }
             continue;
         }
-
-        // El ultrasónico habilita a los sensores 2 y 3 mientras la
-        // presencia detectada esté dentro de la ventana de tiempo.
-        bool habilitado = presenciaVista &&
-                          ((TickType_t)(xTaskGetTickCount() - tickPresencia) <= ventana);
 
         // ---------- Sensores de clasificación ----------
         for (int i = 0; i < 2; i++)
@@ -538,13 +645,17 @@ void tareaSensoresFn(void *parametro)
                 bool reservado = false;
                 EventoGarra evento;
 
-                // Reserva atómica de la garra: evita eventos duplicados
+                // Reserva atómica de la garra: evita eventos duplicados.
+                // En modo MANUAL los sensores no generan eventos automáticos.
                 portENTER_CRITICAL(&mux);
-                if (sistemaActivo && !emergenciaActiva && !garraOcupada)
+                if (sistemaActivo && !emergenciaActiva && !garraOcupada &&
+                    modoOperacion == MODO_AUTO)
                 {
                     garraOcupada = true;
                     evento.sensor = sens[i].id;
                     evento.generacion = generacionParada;
+                    evento.origen = ORIGEN_AUTO;
+                    ultimoEvento = (sens[i].id == 2) ? EV_SENSOR2 : EV_SENSOR3;
                     reservado = true;
                 }
                 portEXIT_CRITICAL(&mux);
@@ -582,15 +693,25 @@ void tareaBandaFn(void *parametro)
         // Decisión y escritura juntas, bajo el mismo bloqueo que usa STOP:
         // así esta tarea nunca puede reactivar la banda después de un STOP.
         portENTER_CRITICAL(&mux);
-        bandaGirando = sistemaActivo && !emergenciaActiva && !garraOcupada;
+
+        // AUTO: condición original.
+        bool permitido = sistemaActivo && !emergenciaActiva && !garraOcupada;
+
+        // En MANUAL además hace falta la solicitud manual.
+        if (modoOperacion == MODO_MANUAL)
+        {
+            permitido = permitido && manualBandaSolicitada;
+        }
+
+        bandaGirando = permitido;
         portEXIT_CRITICAL(&mux);
     }
 }
 
 
-// =====================================================
+// =========================================
 // TAREA GARRA (única que mueve los servos)
-// =====================================================
+// =========================================
 
 void tareaGarraFn(void *parametro)
 {
@@ -607,11 +728,37 @@ void tareaGarraFn(void *parametro)
         // Descartar un aviso anterior que siga pendiente
         xTaskNotifyWait(0, TODOS_LOS_BITS, &bits, 0);
 
-        // Validar el evento: sistema activo y sin STOP desde que se creó
+        // ---------- Solicitud de volver al reposo (GARRA;HOME) ----------
+        if (evento.origen == ORIGEN_HOME)
+        {
+            bool validoHome;
+            portENTER_CRITICAL(&mux);
+            validoHome = !emergenciaActiva &&
+                         (modoOperacion == MODO_MANUAL) &&
+                         (evento.generacion == generacionParada);
+            portEXIT_CRITICAL(&mux);
+
+            if (validoHome)
+            {
+                garraDesactivar();
+            }
+
+            portENTER_CRITICAL(&mux);
+            garraOcupada = false;
+            portEXIT_CRITICAL(&mux);
+
+            xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+            continue;
+        }
+
+        // Validar el evento: sistema activo y sin STOP desde que se creó.
+        // El modo actual debe coincidir con el origen del evento.
         bool valido;
         portENTER_CRITICAL(&mux);
         valido = sistemaActivo && !emergenciaActiva &&
-                 (evento.generacion == generacionParada);
+                 (evento.generacion == generacionParada) &&
+                 ((evento.origen == ORIGEN_MANUAL) ? (modoOperacion == MODO_MANUAL)
+                                                   : (modoOperacion == MODO_AUTO));
         portEXIT_CRITICAL(&mux);
 
         if (valido)
@@ -636,6 +783,8 @@ void tareaGarraFn(void *parametro)
                 // reservada (garraOcupada = true) y la banda sigue detenida.
                 // Se espera, sin bloquear indefinidamente, a que una persona
                 // presione START.
+                garraPausada = true;   // Para la telemetría (GARRA=PAUSADA)
+
                 for (;;)
                 {
                     bool reanudado;
@@ -650,6 +799,8 @@ void tareaGarraFn(void *parametro)
 
                     xTaskNotifyWait(0, TODOS_LOS_BITS, &bits, pdMS_TO_TICKS(100));
                 }
+
+                garraPausada = false;
             }
 
             // Fin normal, o START tras la emergencia: la garra vuelve al
@@ -665,6 +816,371 @@ void tareaGarraFn(void *parametro)
         xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
     }
 }
+
+
+// =====================================================
+// ===== INICIO DEL BLOQUE BLUETOOTH (solo si USAR_BLUETOOTH = 1) =====
+// =====================================================
+#if USAR_BLUETOOTH
+
+// START desde la app: misma lógica que el pulsador, pero rechazada si
+// el pulsador físico STOP sigue presionado. La lectura del pin se hace
+// dentro de la sección crítica para no pisar un STOP físico simultáneo.
+static void comandoStart()
+{
+    bool aceptado = false;
+    bool veniaDeEmergencia = false;
+
+    portENTER_CRITICAL(&mux);
+    if (gpio_get_level((gpio_num_t)STOP) == 1)   // STOP liberado (INPUT_PULLUP)
+    {
+        veniaDeEmergencia = emergenciaActiva;
+        emergenciaActiva = false;
+        sistemaActivo    = true;
+        manualBandaSolicitada = false;
+        ultimoEvento = EV_START_BT;
+        aceptado = true;
+    }
+    else
+    {
+        ultimoEvento = EV_RECH_STOP_FISICO;
+    }
+    portEXIT_CRITICAL(&mux);
+
+    if (aceptado)
+    {
+        if (veniaDeEmergencia)
+        {
+            xTaskNotify(tareaGarra, NOTIF_REANUDAR, eSetBits);
+        }
+        xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+    }
+}
+
+// STOP desde la app: misma lógica de emergencia, pero con funciones de TAREA
+// (no se llama a la ISR ni a funciones FromISR).
+static void comandoStop()
+{
+    portENTER_CRITICAL(&mux);
+    emergenciaActiva = true;
+    sistemaActivo    = false;
+    bandaGirando     = false;
+    manualBandaSolicitada = false;
+    generacionParada++;
+    ultimoEvento = EV_STOP_BT;
+    portEXIT_CRITICAL(&mux);
+
+    gpio_set_level((gpio_num_t)BANDA_STEP, 0);
+
+    // tareaControl (prioridad máxima) interrumpe la espera de la garra
+    // sin mover servos y avisa a la banda.
+    xTaskNotify(tareaControl, NOTIF_STOP, eSetBits);
+}
+
+// Cambio de modo: solo sin emergencia y con la garra libre.
+// Detiene el sistema y exige un nuevo START.
+static void comandoModo(ModoOperacion nuevo)
+{
+    bool aceptado = false;
+
+    portENTER_CRITICAL(&mux);
+    if (emergenciaActiva)
+    {
+        ultimoEvento = EV_RECH_EMERGENCIA;
+    }
+    else if (garraOcupada)
+    {
+        ultimoEvento = EV_RECH_OCUPADA;
+    }
+    else if (modoOperacion == nuevo)
+    {
+        // Ya está en ese modo: no se detiene nada.
+        ultimoEvento = (nuevo == MODO_AUTO) ? EV_MODO_AUTO : EV_MODO_MANUAL;
+    }
+    else
+    {
+        sistemaActivo = false;               // exige un nuevo START
+        manualBandaSolicitada = false;
+        modoOperacion = nuevo;
+        ultimoEvento = (nuevo == MODO_AUTO) ? EV_MODO_AUTO : EV_MODO_MANUAL;
+        aceptado = true;
+    }
+    portEXIT_CRITICAL(&mux);
+
+    if (aceptado)
+    {
+        xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+    }
+}
+
+// Banda manual: solo modifica la solicitud; tareaBandaFn decide bandaGirando.
+static void comandoBanda(bool encender)
+{
+    portENTER_CRITICAL(&mux);
+    if (!encender)
+    {
+        manualBandaSolicitada = false;       // apagar siempre es seguro
+        ultimoEvento = EV_BANDA_OFF;
+    }
+    else if (modoOperacion != MODO_MANUAL)
+    {
+        ultimoEvento = EV_RECH_MODO;
+    }
+    else if (emergenciaActiva)
+    {
+        ultimoEvento = EV_RECH_EMERGENCIA;
+    }
+    else if (!sistemaActivo)
+    {
+        ultimoEvento = EV_RECH_NO_ACTIVO;
+    }
+    else if (garraOcupada)
+    {
+        ultimoEvento = EV_RECH_OCUPADA;
+    }
+    else
+    {
+        manualBandaSolicitada = true;
+        ultimoEvento = EV_BANDA_ON;
+    }
+    portEXIT_CRITICAL(&mux);
+
+    xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+}
+
+// Garra manual: sensor 2 o 3 (clasificación) o 0 (HOME).
+// Nunca mueve servos: reserva la garra y envía un evento a colaGarra.
+static void comandoGarra(uint8_t sensor)
+{
+    EventoGarra evento;
+    bool reservado = false;
+
+    portENTER_CRITICAL(&mux);
+    if (modoOperacion != MODO_MANUAL)
+    {
+        ultimoEvento = EV_RECH_MODO;
+    }
+    else if (emergenciaActiva)
+    {
+        ultimoEvento = EV_RECH_EMERGENCIA;
+    }
+    else if (sensor != 0 && !sistemaActivo)      // HOME no exige sistema iniciado
+    {
+        ultimoEvento = EV_RECH_NO_ACTIVO;
+    }
+    else if (garraOcupada)
+    {
+        ultimoEvento = EV_RECH_OCUPADA;
+    }
+    else
+    {
+        garraOcupada = true;                      // reserva atómica
+        evento.sensor = sensor;
+        evento.generacion = generacionParada;
+        evento.origen = (sensor == 0) ? ORIGEN_HOME : ORIGEN_MANUAL;
+        ultimoEvento = (sensor == 2) ? EV_MANUAL_S2
+                     : (sensor == 3) ? EV_MANUAL_S3
+                                     : EV_HOME;
+        reservado = true;
+    }
+    portEXIT_CRITICAL(&mux);
+
+    if (reservado)
+    {
+        if (xQueueSend(colaGarra, &evento, 0) != pdTRUE)
+        {
+            // Cola llena: se libera la reserva para no bloquear la garra.
+            portENTER_CRITICAL(&mux);
+            garraOcupada = false;
+            ultimoEvento = EV_RECH_COLA;
+            portEXIT_CRITICAL(&mux);
+        }
+
+        xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);   // detener la banda / actualizar
+    }
+}
+
+// Interpreta una línea completa (sin \n). Solo comandos exactos.
+static void procesarComando(const char *cmd)
+{
+    if      (strcmp(cmd, "START")       == 0) comandoStart();
+    else if (strcmp(cmd, "STOP")        == 0) comandoStop();
+    else if (strcmp(cmd, "MODE;AUTO")   == 0) comandoModo(MODO_AUTO);
+    else if (strcmp(cmd, "MODE;MANUAL") == 0) comandoModo(MODO_MANUAL);
+    else if (strcmp(cmd, "BANDA;ON")    == 0) comandoBanda(true);
+    else if (strcmp(cmd, "BANDA;OFF")   == 0) comandoBanda(false);
+    else if (strcmp(cmd, "GARRA;S2")    == 0) comandoGarra(2);
+    else if (strcmp(cmd, "GARRA;S3")    == 0) comandoGarra(3);
+    else if (strcmp(cmd, "GARRA;HOME")  == 0) comandoGarra(0);
+    else
+    {
+        portENTER_CRITICAL(&mux);
+        ultimoEvento = EV_CMD_DESCONOCIDO;
+        portEXIT_CRITICAL(&mux);
+    }
+}
+
+// Toma una copia coherente del estado y envía exactamente 11 campos:
+// ESTADO;AUTO;ACTIVO;BANDA=1;DIST=18.5;PRES=1;S2=0;S3=1;HAB=1;GARRA=REPOSO;EV=NINGUNO\n
+static void enviarTelemetria()
+{
+    Telemetria t;
+    bool sis, emer, banda, ocupada, pausada;
+    ModoOperacion modo;
+    uint8_t ev;
+
+    portENTER_CRITICAL(&mux);
+    t       = tel;
+    sis     = sistemaActivo;
+    emer    = emergenciaActiva;
+    banda   = bandaGirando;
+    ocupada = garraOcupada;
+    pausada = garraPausada;
+    modo    = modoOperacion;
+    ev      = ultimoEvento;
+    portEXIT_CRITICAL(&mux);
+
+    if (ev >= EV_TOTAL) ev = EV_NINGUNO;
+
+    const char *txtModo   = (modo == MODO_MANUAL) ? "MANUAL" : "AUTO";
+    const char *txtSis    = emer ? "EMERGENCIA" : (sis ? "ACTIVO" : "DETENIDO");
+    const char *txtGarra  = pausada ? "PAUSADA" : (ocupada ? "OCUPADA" : "REPOSO");
+
+    char dist[12];
+    if (t.distanciaCm > 0.0f) snprintf(dist, sizeof(dist), "%.1f", t.distanciaCm);
+    else                      snprintf(dist, sizeof(dist), "-1");
+
+    char msg[200];
+    int n = snprintf(msg, sizeof(msg),
+                     "ESTADO;%s;%s;BANDA=%d;DIST=%s;PRES=%d;S2=%d;S3=%d;HAB=%d;GARRA=%s;EV=%s\n",
+                     txtModo, txtSis,
+                     banda ? 1 : 0,
+                     dist,
+                     (int)t.presencia,
+                     t.s2 ? 1 : 0,
+                     t.s3 ? 1 : 0,
+                     t.habilitado ? 1 : 0,
+                     txtGarra,
+                     NOMBRES_EVENTO[ev]);
+
+    if (n > 0 && n < (int)sizeof(msg))
+    {
+        SerialBT.write((const uint8_t *)msg, (size_t)n);
+    }
+}
+
+// TAREA BLUETOOTH (prioridad baja)
+void tareaBluetoothFn(void *parametro)
+{
+    char   linea[TAM_LINEA_BT];
+    size_t idx = 0;
+    bool   descartando = false;      // línea demasiado larga: se descarta completa
+    bool   conectadoPrev = false;
+
+    TickType_t ultimoEnvio = xTaskGetTickCount();
+
+    for (;;)
+    {
+        vTaskDelay(pdMS_TO_TICKS(PERIODO_TAREA_BT_MS));
+
+        bool conectado = SerialBT.hasClient();
+
+        // ---------- Sin conexión ----------
+        if (!conectado)
+        {
+            if (conectadoPrev)
+            {
+                // Desconexión: se retira la solicitud manual de la banda.
+                // En AUTO la clasificación sigue funcionando normalmente.
+                portENTER_CRITICAL(&mux);
+                manualBandaSolicitada = false;
+                ultimoEvento = EV_BT_DESCONECTADO;
+                portEXIT_CRITICAL(&mux);
+
+                xTaskNotify(tareaBanda, NOTIF_ACTUALIZAR, eSetBits);
+            }
+
+            // Se descarta todo lo pendiente: nada antiguo se ejecuta al reconectar.
+            idx = 0;
+            descartando = false;
+            while (SerialBT.available())
+            {
+                SerialBT.read();
+            }
+
+            conectadoPrev = false;
+            continue;
+        }
+
+        // ---------- Conexión nueva ----------
+        if (!conectadoPrev)
+        {
+            conectadoPrev = true;
+            idx = 0;
+            descartando = false;
+            // Fuerza un envío inmediato de estado
+            ultimoEnvio = xTaskGetTickCount() - pdMS_TO_TICKS(PERIODO_TELEMETRIA_MS);
+        }
+
+        // ---------- Recepción de comandos (sin bloquear) ----------
+        int leidos = 0;
+        while (SerialBT.available() && leidos < MAX_BYTES_POR_CICLO)
+        {
+            int c = SerialBT.read();
+            leidos++;
+
+            if (c < 0)
+            {
+                break;
+            }
+
+            if (c == '\r')
+            {
+                continue;                       // se ignora
+            }
+
+            if (c == '\n')
+            {
+                if (!descartando && idx > 0)
+                {
+                    linea[idx] = '\0';
+                    procesarComando(linea);     // solo líneas completas
+                }
+                idx = 0;
+                descartando = false;
+                continue;
+            }
+
+            if (descartando)
+            {
+                continue;
+            }
+
+            if (idx < (TAM_LINEA_BT - 1))
+            {
+                linea[idx++] = (char)c;
+            }
+            else
+            {
+                // Línea demasiado larga: se descarta hasta el próximo '\n'.
+                descartando = true;
+                idx = 0;
+            }
+        }
+
+        // ---------- Telemetría periódica ----------
+        if ((TickType_t)(xTaskGetTickCount() - ultimoEnvio) >= pdMS_TO_TICKS(PERIODO_TELEMETRIA_MS))
+        {
+            ultimoEnvio = xTaskGetTickCount();
+            enviarTelemetria();
+        }
+    }
+}
+
+#endif  // USAR_BLUETOOTH
+// =====================================================
+// ===== FIN DEL BLOQUE BLUETOOTH =====
+// =====================================================
 
 
 // =====================================================
@@ -690,7 +1206,7 @@ void setup()
     pinMode(ULTRA_TRIG, OUTPUT);
     digitalWrite(ULTRA_TRIG, LOW);
     digitalWrite(BANDA_STEP, LOW);
-    digitalWrite(BANDA_DIR, SENTIDO_BANDA);   // Sentido horario, como la prueba
+    digitalWrite(BANDA_DIR, SENTIDO_BANDA);
     bandaGirando = false;
 
     // ---------- Servomotores en posición inicial ----------
@@ -716,15 +1232,25 @@ void setup()
     esp_timer_create(&argsTimer, &timerPasos);
     esp_timer_start_once(timerPasos, 1000);   // no emite pulsos hasta START
 
-    // ---------- Cola sensores -> garra ----------
+    // ---------- Cola sensores/Bluetooth -> garra ----------
     colaGarra = xQueueCreate(2, sizeof(EventoGarra));
 
-    // ---------- Tareas ----------
+    // ---------- Tareas originales ----------
     // Orden: primero las que otras tareas notifican.
     xTaskCreatePinnedToCore(tareaBandaFn,    "banda",    2048, NULL, PRIO_BANDA,    &tareaBanda,    NUCLEO_APP);
     xTaskCreatePinnedToCore(tareaGarraFn,    "garra",    4096, NULL, PRIO_GARRA,    &tareaGarra,    NUCLEO_APP);
     xTaskCreatePinnedToCore(tareaControlFn,  "control",  3072, NULL, PRIO_CONTROL,  &tareaControl,  NUCLEO_APP);
     xTaskCreatePinnedToCore(tareaSensoresFn, "sensores", 3072, NULL, PRIO_SENSORES, &tareaSensores, NUCLEO_APP);
+
+    // ---------- Bluetooth (solo si USAR_BLUETOOTH = 1) ----------
+    // Si Bluetooth no inicia, la clasificadora sigue funcionando sin él.
+#if USAR_BLUETOOTH
+    if (SerialBT.begin(NOMBRE_BLUETOOTH))
+    {
+        xTaskCreatePinnedToCore(tareaBluetoothFn, "bluetooth", 4096, NULL,
+                                PRIO_BLUETOOTH, &tareaBluetooth, NUCLEO_APP);
+    }
+#endif
 
     // ---------- Interrupciones (al final, con las tareas ya creadas) ----------
     attachInterrupt(digitalPinToInterrupt(INICIO), interrupcionInicio, FALLING);
